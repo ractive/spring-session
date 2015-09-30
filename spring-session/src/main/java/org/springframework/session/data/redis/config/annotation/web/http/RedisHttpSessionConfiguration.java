@@ -18,11 +18,10 @@ package org.springframework.session.data.redis.config.annotation.web.http;
 import java.util.Arrays;
 import java.util.Map;
 
-import javax.servlet.ServletContext;
-
 import org.springframework.beans.factory.BeanClassLoaderAware;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -32,20 +31,20 @@ import org.springframework.core.annotation.AnnotationUtils;
 import org.springframework.core.type.AnnotationMetadata;
 import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.data.redis.core.RedisOperations;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.listener.PatternTopic;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
+import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.data.redis.serializer.StringRedisSerializer;
 import org.springframework.scheduling.annotation.EnableScheduling;
-import org.springframework.session.ExpiringSession;
-import org.springframework.session.SessionRepository;
+import org.springframework.session.config.annotation.web.http.SpringHttpSessionConfiguration;
 import org.springframework.session.data.redis.RedisOperationsSessionRepository;
-import org.springframework.session.data.redis.SessionMessageListener;
 import org.springframework.session.data.redis.config.ConfigureNotifyKeyspaceEventsAction;
 import org.springframework.session.data.redis.config.ConfigureRedisAction;
-import org.springframework.session.web.http.HttpSessionStrategy;
 import org.springframework.session.web.http.SessionRepositoryFilter;
 import org.springframework.util.ClassUtils;
+import org.springframework.util.StringUtils;
 
 /**
  * Exposes the {@link SessionRepositoryFilter} as a bean named
@@ -59,62 +58,68 @@ import org.springframework.util.ClassUtils;
  */
 @Configuration
 @EnableScheduling
-public class RedisHttpSessionConfiguration implements ImportAware, BeanClassLoaderAware {
+public class RedisHttpSessionConfiguration extends SpringHttpSessionConfiguration implements ImportAware, BeanClassLoaderAware {
 
 	private ClassLoader beanClassLoader;
 
 	private Integer maxInactiveIntervalInSeconds = 1800;
 
-	private HttpSessionStrategy httpSessionStrategy;
-
-	@Autowired
-	private ApplicationEventPublisher eventPublisher;
-
 	private ConfigureRedisAction configureRedisAction = new ConfigureNotifyKeyspaceEventsAction();
+
+	private String redisNamespace = "";
+
+	private RedisSerializer<Object> defaultRedisSerializer;
 
 	@Bean
 	public RedisMessageListenerContainer redisMessageListenerContainer(
-			RedisConnectionFactory connectionFactory) {
+			RedisConnectionFactory connectionFactory, RedisOperationsSessionRepository messageListener) {
+
 		RedisMessageListenerContainer container = new RedisMessageListenerContainer();
 		container.setConnectionFactory(connectionFactory);
-		container.addMessageListener(redisSessionMessageListener(),
-				Arrays.asList(new PatternTopic("__keyevent@*:del"),new PatternTopic("__keyevent@*:expired")));
+		container.addMessageListener(messageListener,
+				Arrays.asList(new PatternTopic("__keyevent@*:del"), new PatternTopic("__keyevent@*:expired")));
+		container.addMessageListener(messageListener, Arrays.asList(new PatternTopic(messageListener.getSessionCreatedChannelPrefix() + "*")));
 		return container;
 	}
 
 	@Bean
-	public SessionMessageListener redisSessionMessageListener() {
-		return new SessionMessageListener(eventPublisher);
-	}
-
-	@Bean
-	public RedisTemplate<String,ExpiringSession> sessionRedisTemplate(RedisConnectionFactory connectionFactory) {
-		RedisTemplate<String, ExpiringSession> template = new RedisTemplate<String, ExpiringSession>();
+	public RedisTemplate<Object,Object> sessionRedisTemplate(RedisConnectionFactory connectionFactory) {
+		RedisTemplate<Object, Object> template = new RedisTemplate<Object, Object>();
 		template.setKeySerializer(new StringRedisSerializer());
 		template.setHashKeySerializer(new StringRedisSerializer());
+		if(defaultRedisSerializer != null) {
+			template.setDefaultSerializer(defaultRedisSerializer);
+		}
 		template.setConnectionFactory(connectionFactory);
 		return template;
 	}
 
 	@Bean
-	public RedisOperationsSessionRepository sessionRepository(RedisTemplate<String, ExpiringSession> sessionRedisTemplate) {
+	public RedisOperationsSessionRepository sessionRepository(@Qualifier("sessionRedisTemplate") RedisOperations<Object, Object> sessionRedisTemplate, ApplicationEventPublisher applicationEventPublisher) {
 		RedisOperationsSessionRepository sessionRepository = new RedisOperationsSessionRepository(sessionRedisTemplate);
+		sessionRepository.setApplicationEventPublisher(applicationEventPublisher);
 		sessionRepository.setDefaultMaxInactiveInterval(maxInactiveIntervalInSeconds);
-		return sessionRepository;
-	}
 
-	@Bean
-	public <S extends ExpiringSession> SessionRepositoryFilter<? extends ExpiringSession> springSessionRepositoryFilter(SessionRepository<S> sessionRepository, ServletContext servletContext) {
-		SessionRepositoryFilter<S> sessionRepositoryFilter = new SessionRepositoryFilter<S>(sessionRepository);
-		sessionRepositoryFilter.setServletContext(servletContext);
-		if(httpSessionStrategy != null) {
-			sessionRepositoryFilter.setHttpSessionStrategy(httpSessionStrategy);
+		String redisNamespace = getRedisNamespace();
+		if(StringUtils.hasText(redisNamespace)) {
+			sessionRepository.setRedisKeyNamespace(redisNamespace);
 		}
-		return sessionRepositoryFilter;
+		return sessionRepository;
 	}
 
 	public void setMaxInactiveIntervalInSeconds(int maxInactiveIntervalInSeconds) {
 		this.maxInactiveIntervalInSeconds = maxInactiveIntervalInSeconds;
+	}
+
+	public void setRedisNamespace(String namespace) {
+		this.redisNamespace = namespace;
+	}
+
+	private String getRedisNamespace() {
+		if(StringUtils.hasText(this.redisNamespace)) {
+			return this.redisNamespace;
+		}
+		return System.getProperty("spring.session.redis.namespace","");
 	}
 
 	public void setImportMetadata(AnnotationMetadata importMetadata) {
@@ -125,25 +130,21 @@ public class RedisHttpSessionConfiguration implements ImportAware, BeanClassLoad
 			// search parent classes
 			Class<?> currentClass = ClassUtils.resolveClassName(importMetadata.getClassName(), beanClassLoader);
 			for(Class<?> classToInspect = currentClass ;classToInspect != null; classToInspect = classToInspect.getSuperclass()) {
-				EnableRedisHttpSession enableWebSecurityAnnotation = AnnotationUtils.findAnnotation(classToInspect, EnableRedisHttpSession.class);
-				if(enableWebSecurityAnnotation == null) {
+				EnableRedisHttpSession enableRedisHttpSessionAnnotation = AnnotationUtils.findAnnotation(classToInspect, EnableRedisHttpSession.class);
+				if(enableRedisHttpSessionAnnotation == null) {
 					continue;
 				}
 				enableAttrMap = AnnotationUtils
-						.getAnnotationAttributes(enableWebSecurityAnnotation);
+						.getAnnotationAttributes(enableRedisHttpSessionAnnotation);
 				enableAttrs = AnnotationAttributes.fromMap(enableAttrMap);
 			}
 		}
 		maxInactiveIntervalInSeconds = enableAttrs.getNumber("maxInactiveIntervalInSeconds");
-	}
-
-	@Autowired(required = false)
-	public void setHttpSessionStrategy(HttpSessionStrategy httpSessionStrategy) {
-		this.httpSessionStrategy = httpSessionStrategy;
+		this.redisNamespace = enableAttrs.getString("redisNamespace");
 	}
 
 	@Bean
-	public EnableRedisKeyspaceNotificationsInitializer enableRedisKeyspaceNotificationsInitializer(RedisConnectionFactory connectionFactory) {
+	public InitializingBean enableRedisKeyspaceNotificationsInitializer(RedisConnectionFactory connectionFactory) {
 		return new EnableRedisKeyspaceNotificationsInitializer(connectionFactory, configureRedisAction);
 	}
 
@@ -153,8 +154,6 @@ public class RedisHttpSessionConfiguration implements ImportAware, BeanClassLoad
 	 * cleaned up properly. For example, the mapping of the Session to WebSocket connections may not get cleaned up.
 	 */
 	static class EnableRedisKeyspaceNotificationsInitializer implements InitializingBean {
-		static final String CONFIG_NOTIFY_KEYSPACE_EVENTS = "notify-keyspace-events";
-
 		private final RedisConnectionFactory connectionFactory;
 
 		private ConfigureRedisAction configure;
@@ -178,6 +177,12 @@ public class RedisHttpSessionConfiguration implements ImportAware, BeanClassLoad
 	@Autowired(required = false)
 	public void setConfigureRedisAction(ConfigureRedisAction configureRedisAction) {
 		this.configureRedisAction = configureRedisAction;
+	}
+
+	@Autowired(required = false)
+	@Qualifier("defaultRedisSerializer")
+	public void setDefaultRedisSerializer(RedisSerializer<Object> defaultRedisSerializer) {
+		this.defaultRedisSerializer = defaultRedisSerializer;
 	}
 
 	/* (non-Javadoc)

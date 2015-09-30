@@ -17,6 +17,9 @@ package org.springframework.session.data.redis;
 
 import static org.fest.assertions.Assertions.assertThat;
 
+import java.util.Map;
+import java.util.UUID;
+
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -25,17 +28,18 @@ import org.springframework.context.ApplicationListener;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.data.redis.connection.jedis.JedisConnectionFactory;
+import org.springframework.data.redis.core.RedisOperations;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.authority.AuthorityUtils;
 import org.springframework.security.core.context.SecurityContext;
 import org.springframework.security.core.context.SecurityContextHolder;
 import org.springframework.session.Session;
-import org.springframework.session.SessionRepository;
+import org.springframework.session.data.redis.RedisOperationsSessionRepository.RedisSession;
 import org.springframework.session.data.redis.config.annotation.web.http.EnableRedisHttpSession;
+import org.springframework.session.events.AbstractSessionEvent;
+import org.springframework.session.events.SessionCreatedEvent;
 import org.springframework.session.events.SessionDestroyedEvent;
-import org.springframework.session.redis.embedded.EnableEmbeddedRedis;
-import org.springframework.session.redis.embedded.RedisServerPort;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
 import org.springframework.test.context.web.WebAppConfiguration;
@@ -43,49 +47,65 @@ import org.springframework.test.context.web.WebAppConfiguration;
 @RunWith(SpringJUnit4ClassRunner.class)
 @ContextConfiguration
 @WebAppConfiguration
-public class RedisOperationsSessionRepositoryITests<S extends Session> {
+public class RedisOperationsSessionRepositoryITests {
 	@Autowired
-	private SessionRepository<S> repository;
+	private RedisOperationsSessionRepository repository;
 
 	@Autowired
-	private SessionDestroyedEventRegistry registry;
+	private SessionEventRegistry registry;
 
-	private final Object lock = new Object();
+	@Autowired
+	RedisOperations<Object, Object> redis;
 
 	@Before
 	public void setup() {
-		registry.setLock(lock);
+		registry.clear();
 	}
 
 	@Test
 	public void saves() throws InterruptedException {
-		S toSave = repository.createSession();
-		toSave.setAttribute("a", "b");
-		Authentication toSaveToken = new UsernamePasswordAuthenticationToken("user","password", AuthorityUtils.createAuthorityList("ROLE_USER"));
+		String username = "saves-"+System.currentTimeMillis();
+
+		String usernameSessionKey = "spring:session:RedisOperationsSessionRepositoryITests:index:" + Session.PRINCIPAL_NAME_ATTRIBUTE_NAME + ":" + username;
+
+		RedisSession toSave = repository.createSession();
+		String expectedAttributeName = "a";
+		String expectedAttributeValue = "b";
+		toSave.setAttribute(expectedAttributeName, expectedAttributeValue);
+		Authentication toSaveToken = new UsernamePasswordAuthenticationToken(username,"password", AuthorityUtils.createAuthorityList("ROLE_USER"));
 		SecurityContext toSaveContext = SecurityContextHolder.createEmptyContext();
 		toSaveContext.setAuthentication(toSaveToken);
 		toSave.setAttribute("SPRING_SECURITY_CONTEXT", toSaveContext);
+		toSave.setAttribute(Session.PRINCIPAL_NAME_ATTRIBUTE_NAME, username);
+		registry.clear();
 
 		repository.save(toSave);
+
+		assertThat(registry.receivedEvent()).isTrue();
+		assertThat(registry.getEvent()).isInstanceOf(SessionCreatedEvent.class);
+		assertThat(redis.boundSetOps(usernameSessionKey).members()).contains(toSave.getId());
 
 		Session session = repository.getSession(toSave.getId());
 
 		assertThat(session.getId()).isEqualTo(toSave.getId());
 		assertThat(session.getAttributeNames()).isEqualTo(session.getAttributeNames());
-		assertThat(session.getAttribute("a")).isEqualTo(toSave.getAttribute("a"));
+		assertThat(session.getAttribute(expectedAttributeName)).isEqualTo(toSave.getAttribute(expectedAttributeName));
+
+		registry.clear();
 
 		repository.delete(toSave.getId());
 
 		assertThat(repository.getSession(toSave.getId())).isNull();
-		synchronized (lock) {
-			lock.wait(3000);
-		}
-		assertThat(registry.receivedEvent()).isTrue();
+		assertThat(registry.getEvent()).isInstanceOf(SessionDestroyedEvent.class);
+		assertThat(redis.boundSetOps(usernameSessionKey).members()).excludes(toSave.getId());
+
+
+		assertThat(registry.getEvent().getSession().getAttribute(expectedAttributeName)).isEqualTo(expectedAttributeValue);
 	}
 
 	@Test
 	public void putAllOnSingleAttrDoesNotRemoveOld() {
-		S toSave = repository.createSession();
+		RedisSession toSave = repository.createSession();
 		toSave.setAttribute("a", "b");
 
 		repository.save(toSave);
@@ -100,43 +120,80 @@ public class RedisOperationsSessionRepositoryITests<S extends Session> {
 		assertThat(session.getAttributeNames().size()).isEqualTo(2);
 		assertThat(session.getAttribute("a")).isEqualTo("b");
 		assertThat(session.getAttribute("1")).isEqualTo("2");
+
+		repository.delete(toSave.getId());
 	}
 
-	static class SessionDestroyedEventRegistry implements ApplicationListener<SessionDestroyedEvent> {
-		private boolean receivedEvent;
-		private Object lock;
+	@Test
+	public void findByPrincipalName() throws Exception {
+		String principalName = "findByPrincipalName" + UUID.randomUUID();
+		RedisSession toSave = repository.createSession();
+		toSave.setAttribute(Session.PRINCIPAL_NAME_ATTRIBUTE_NAME, principalName);
 
-		public void onApplicationEvent(SessionDestroyedEvent event) {
-			receivedEvent = true;
+		repository.save(toSave);
+
+		Map<String, RedisSession> findByPrincipalName = repository.findByPrincipalName(principalName);
+
+		assertThat(findByPrincipalName).hasSize(1);
+		assertThat(findByPrincipalName.keySet()).containsOnly(toSave.getId());
+
+		repository.delete(toSave.getId());
+		registry.receivedEvent();
+
+		findByPrincipalName = repository.findByPrincipalName(principalName);
+
+		assertThat(findByPrincipalName).hasSize(0);
+		assertThat(findByPrincipalName.keySet()).excludes(toSave.getId());
+	}
+
+	static class SessionEventRegistry implements ApplicationListener<AbstractSessionEvent> {
+		private AbstractSessionEvent event;
+		private final Object lock = new Object();
+
+		public void onApplicationEvent(AbstractSessionEvent event) {
+			this.event = event;
 			synchronized (lock) {
 				lock.notifyAll();
 			}
 		}
 
-		public boolean receivedEvent() {
-			return receivedEvent;
+		public void clear() {
+			this.event = null;
 		}
 
-		public void setLock(Object lock) {
-			this.lock = lock;
+		public boolean receivedEvent() throws InterruptedException {
+			return waitForEvent() != null;
+		}
+
+		@SuppressWarnings("unchecked")
+		public <E extends AbstractSessionEvent> E getEvent() throws InterruptedException {
+			return (E) waitForEvent();
+		}
+
+		@SuppressWarnings("unchecked")
+		private <E extends AbstractSessionEvent> E waitForEvent() throws InterruptedException {
+			synchronized(lock) {
+				if(event == null) {
+					lock.wait(3000);
+				}
+			}
+			return (E) event;
 		}
 	}
 
 	@Configuration
-	@EnableRedisHttpSession
-	@EnableEmbeddedRedis
+	@EnableRedisHttpSession(redisNamespace = "RedisOperationsSessionRepositoryITests")
 	static class Config {
 		@Bean
-		public JedisConnectionFactory connectionFactory(@RedisServerPort int port) throws Exception {
+		public JedisConnectionFactory connectionFactory() throws Exception {
 			JedisConnectionFactory factory = new JedisConnectionFactory();
-			factory.setPort(port);
 			factory.setUsePool(false);
 			return factory;
 		}
 
 		@Bean
-		public SessionDestroyedEventRegistry sessionDestroyedEventRegistry() {
-			return new SessionDestroyedEventRegistry();
+		public SessionEventRegistry sessionEventRegistry() {
+			return new SessionEventRegistry();
 		}
 	}
 }

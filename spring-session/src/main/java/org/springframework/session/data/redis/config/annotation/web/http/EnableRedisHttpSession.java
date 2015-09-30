@@ -22,14 +22,15 @@ import java.lang.annotation.Target;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
+import org.springframework.session.config.annotation.web.http.EnableSpringHttpSession;
 
 /**
  * Add this annotation to an {@code @Configuration} class to expose the
  * SessionRepositoryFilter as a bean named "springSessionRepositoryFilter" and
  * backed by Redis. In order to leverage the annotation, a single {@link RedisConnectionFactory}
  * must be provided. For example:
- *
  * <pre>
+ * <code>
  * {@literal @Configuration}
  * {@literal @EnableRedisHttpSession}
  * public class RedisHttpSessionConfig {
@@ -40,12 +41,14 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
  *     }
  *
  * }
+ * </code>
  * </pre>
  *
  * More advanced configurations can extend {@link RedisHttpSessionConfiguration} instead.
  *
  * @author Rob Winch
  * @since 1.0
+ * @see EnableSpringHttpSession
  */
 @Retention(value=java.lang.annotation.RetentionPolicy.RUNTIME)
 @Target(value={java.lang.annotation.ElementType.TYPE})
@@ -54,4 +57,23 @@ import org.springframework.data.redis.connection.RedisConnectionFactory;
 @Configuration
 public @interface EnableRedisHttpSession {
 	int maxInactiveIntervalInSeconds() default 1800;
+
+	/**
+	 * <p>
+	 * Defines a unique namespace for keys. The value is used to isolate
+	 * sessions by changing the prefix from "spring:session:" to
+	 * "spring:session:&lt;redisNamespace&gt;:". The default is "" such that all Redis
+	 * keys begin with "spring:session".
+	 * </p>
+	 *
+	 * <p>
+	 * For example, if you had an application named "Application A" that needed
+	 * to keep the sessions isolated from "Application B" you could set two
+	 * different values for the applications and they could function within the
+	 * same Redis instance.
+	 * </p>
+	 *
+	 * @return
+	 */
+	String redisNamespace() default "";
 }

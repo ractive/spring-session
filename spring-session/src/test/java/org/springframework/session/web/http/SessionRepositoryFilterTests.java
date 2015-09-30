@@ -19,7 +19,6 @@ import static org.fest.assertions.Assertions.assertThat;
 import static org.junit.Assert.fail;
 import static org.mockito.Matchers.any;
 import static org.mockito.Matchers.eq;
-import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
@@ -51,7 +50,7 @@ import org.junit.runner.RunWith;
 import org.mockito.Mock;
 import org.mockito.runners.MockitoJUnitRunner;
 import org.springframework.core.Ordered;
-import org.springframework.core.annotation.OrderUtils;
+import org.springframework.core.annotation.AnnotationAwareOrderComparator;
 import org.springframework.mock.web.MockFilterChain;
 import org.springframework.mock.web.MockHttpServletRequest;
 import org.springframework.mock.web.MockHttpServletResponse;
@@ -64,9 +63,11 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 @RunWith(MockitoJUnitRunner.class)
 @SuppressWarnings("deprecation")
-public class SessionRepositoryFilterTests<S extends ExpiringSession> {
+public class SessionRepositoryFilterTests {
 	@Mock
 	private HttpSessionStrategy strategy;
+
+	private Map<String, ExpiringSession> sessions;
 
 	private SessionRepository<ExpiringSession> sessionRepository;
 
@@ -80,7 +81,8 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 
 	@Before
 	public void setup() throws Exception {
-		sessionRepository = new MapSessionRepository();
+		sessions = new HashMap<String, ExpiringSession>();
+		sessionRepository = new MapSessionRepository(sessions);
 		filter = new SessionRepositoryFilter<ExpiringSession>(sessionRepository);
 		setupRequest();
 	}
@@ -174,6 +176,7 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 		});
 
 		final String id = (String) request.getAttribute(ID_ATTR);
+		setupRequest();
 
 		doFilter(new DoInFilter() {
 			@Override
@@ -473,7 +476,13 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 		doFilter(new DoInFilter() {
 			@Override
 			public void doFilter(HttpServletRequest wrappedRequest) {
-				ReflectionTestUtils.invokeMethod(wrappedRequest, "changeSessionId");
+				HttpSession originalSession = wrappedRequest.getSession();
+				assertThat(originalSession.getId()).isEqualTo(originalSessionId);
+
+				String changeSessionId = ReflectionTestUtils.invokeMethod(wrappedRequest, "changeSessionId");
+				assertThat(changeSessionId).isNotEqualTo(originalSessionId);
+				// gh-227
+				assertThat(originalSession.getId()).isEqualTo(changeSessionId);
 			}
 		});
 
@@ -550,6 +559,28 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 				assertThat(wrappedRequest.getSession(false)).isNotNull();
 			}
 		});
+	}
+
+	// gh-229
+	@Test
+	public void doFilterGetSessionGetSessionOnError() throws Exception {
+		doFilter(new DoInFilter() {
+			@Override
+			public void doFilter(HttpServletRequest wrappedRequest) {
+				wrappedRequest.getSession().setAttribute("a", "b");
+			}
+		});
+
+		// reuse the same request similar to processing an ERROR dispatch
+
+		doFilter(new DoInFilter() {
+			@Override
+			public void doFilter(HttpServletRequest wrappedRequest) {
+				assertThat(wrappedRequest.getSession(false)).isNotNull();
+			}
+		});
+
+		assertThat(this.sessions.size()).isEqualTo(1);
 	}
 
 	@Test
@@ -1071,6 +1102,7 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 		HttpServletRequest request = (HttpServletRequest) chain.getRequest();
 		String id = request.getSession().getId();
 		when(strategy.getRequestedSessionId(any(HttpServletRequest.class))).thenReturn(id);
+		setupRequest();
 
 		doFilter(new DoInFilter(){
 			@Override
@@ -1137,7 +1169,7 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 
 	@Test
 	public void order() {
-		assertThat(OrderUtils.getOrder(filter.getClass())).isEqualTo(SessionRepositoryFilter.DEFAULT_ORDER);
+		assertThat(AnnotationAwareOrderComparator.INSTANCE.compare(filter, new SessionRepositoryFilterDefaultOrder()));
 	}
 
 	// We want the filter to work without any dependencies on Spring
@@ -1145,6 +1177,16 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 	@SuppressWarnings("unused")
 	public void doesNotImplementOrdered() {
 		Ordered o = (Ordered) filter;
+	}
+
+	@Test(expected = IllegalArgumentException.class)
+	public void setHttpSessionStrategyNull() {
+		filter.setHttpSessionStrategy((HttpSessionStrategy) null);
+	}
+
+	@Test(expected = IllegalArgumentException.class)
+	public void setMultiHttpSessionStrategyNull() {
+		filter.setHttpSessionStrategy((MultiHttpSessionStrategy) null);
 	}
 
 	// --- helper methods
@@ -1214,5 +1256,11 @@ public class SessionRepositoryFilterTests<S extends ExpiringSession> {
 			doFilter(wrappedRequest);
 		}
 		void doFilter(HttpServletRequest wrappedRequest) {}
+	}
+
+	static class SessionRepositoryFilterDefaultOrder implements Ordered {
+		public int getOrder() {
+			return SessionRepositoryFilter.DEFAULT_ORDER;
+		}
 	}
 }
